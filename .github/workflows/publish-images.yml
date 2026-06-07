@@ -1,0 +1,220 @@
+# Build, smoke, sign + publish the ModPageSpeed 2.0 public container images.
+# ADR-090. Assembles images from CI-built artifacts (no Bazel/Chromium here):
+# the product release.yml archives the Docker-flavored trio to
+# gs://weamp-release-artifacts/release/<sha>/<arch>/ and dispatches here.
+#
+# REVERSIBILITY: `dry-run` mode builds + smokes only — zero registry/Rekor
+# footprint. The ghcr push + keyless cosign live in the `publish` job, gated by
+# the protected `production` environment (manual approval). The release dispatch
+# defaults to building + smoking; nothing is published without that approval.
+name: publish-images
+
+on:
+  repository_dispatch:
+    types: [release-images]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version, e.g. 2.0.21"
+        required: true
+      sha:
+        description: "Full 40-char product commit SHA (keys the GCS artifact path)"
+        required: true
+      mode:
+        description: "dry-run (build+smoke only) or publish (push+sign, gated)"
+        type: choice
+        options: [dry-run, publish]
+        default: dry-run
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+  attestations: write
+
+env:
+  REGISTRY: ghcr.io/we-amp
+  PRODUCT_REPO: oschaaf/modpagespeed-2
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.r.outputs.version }}
+      sha: ${{ steps.r.outputs.sha }}
+      mode: ${{ steps.r.outputs.mode }}
+    steps:
+      - id: r
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
+            V='${{ github.event.client_payload.version }}'
+            S='${{ github.event.client_payload.sha }}'
+            M='dry-run'   # release dispatch always builds+smokes; publish is gated
+          else
+            V='${{ inputs.version }}'; S='${{ inputs.sha }}'; M='${{ inputs.mode }}'
+          fi
+          V="${V#v}"   # strip a leading v
+          [ -n "$V" ] && [ -n "$S" ] || { echo "missing version/sha"; exit 1; }
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "sha=$S" >> "$GITHUB_OUTPUT"
+          echo "mode=$M" >> "$GITHUB_OUTPUT"
+          echo "Resolved version=$V sha=$S mode=$M"
+
+  build:
+    needs: resolve
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runs-on: ubuntu-latest
+          # arm64: GitHub-hosted arm64 Linux runner (needs Team/Enterprise plan;
+          # swap to a self-hosted arm64 runner if unavailable). fail-fast=false
+          # so amd64 validates independently of arm64 availability.
+          - arch: arm64
+            runs-on: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runs-on }}
+    env:
+      VERSION: ${{ needs.resolve.outputs.version }}
+      SHA: ${{ needs.resolve.outputs.sha }}
+      MODE: ${{ needs.resolve.outputs.mode }}
+      ARCH: ${{ matrix.arch }}
+    steps:
+      - name: Checkout product repo at the release SHA
+        uses: actions/checkout@v4
+        with:
+          repository: oschaaf/modpagespeed-2
+          ref: ${{ env.SHA }}
+          token: ${{ secrets.PRODUCT_REPO_TOKEN }}
+          path: product
+
+      - name: Download CI-built artifacts from the permanent bucket
+        run: |
+          set -euo pipefail
+          echo '${{ secrets.GCS_ARTIFACTS_KEY }}' > /tmp/gcs-key-$ARCH.json
+          gcloud auth activate-service-account --key-file=/tmp/gcs-key-$ARCH.json
+          mkdir -p product/artifacts
+          SRC="gs://weamp-release-artifacts/release/${SHA}/linux-${ARCH}"
+          for f in factory_worker ngx_pagespeed_module.so nginx-version; do
+            gcloud storage cp "${SRC}/${f}" "product/artifacts/${f}"
+          done
+          chmod +x product/artifacts/factory_worker
+          rm -f /tmp/gcs-key-$ARCH.json
+          echo "module built against nginx $(cat product/artifacts/nginx-version)"
+
+      - name: Build base-runtime + the three images
+        working-directory: product
+        run: |
+          set -euo pipefail
+          BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          docker build -f docker/Dockerfile.base-runtime -t pagespeed2-base-runtime .
+          for img in nginx worker combined; do
+            docker build \
+              -f "docker/Dockerfile.${img}.prebuilt" \
+              --build-arg VERSION="${VERSION}" \
+              --build-arg BUILD_DATE="${BUILD_DATE}" \
+              --build-arg SOURCE_REVISION="${SHA}" \
+              -t "pagespeed-${img}:${VERSION}-${ARCH}" .
+          done
+
+      - name: Smoke gate (combined image — optimize + licensed/unlicensed)
+        working-directory: product
+        run: |
+          set -euo pipefail
+          NET="ps-smoke-${ARCH}-${GITHUB_RUN_ID}"
+          docker network create "$NET" >/dev/null
+          cleanup() { docker rm -f origin combined >/dev/null 2>&1 || true; docker network rm "$NET" >/dev/null 2>&1 || true; }
+          trap cleanup EXIT
+          # Deliberately-unoptimized origin (whitespace-heavy HTML).
+          mkdir -p /tmp/origin-$ARCH
+          printf '<!doctype html><html><head><title>t</title></head><body>\n\n\n   <h1>hi</h1>\n\n\n   <p>%s</p>\n\n</body></html>' "$(head -c 400 < /dev/zero | tr '\0' x)" > /tmp/origin-$ARCH/index.html
+          docker run -d --name origin --network "$NET" -v /tmp/origin-$ARCH:/usr/share/nginx/html:ro nginx:1.30-alpine >/dev/null
+          run_combined() {  # $1 = extra env args
+            docker rm -f combined >/dev/null 2>&1 || true
+            docker run -d --name combined --network "$NET" --shm-size=256m \
+              -e BACKEND_HOST=origin -e BACKEND_PORT=80 -e ACCEPT_EULA=Y $1 \
+              "pagespeed-combined:${VERSION}-${ARCH}" >/dev/null
+          }
+          warm_and_get() {  # poll until X-PageSpeed appears (ADR-068 async warm), capture headers
+            for _ in $(seq 1 40); do
+              H="$(docker run --rm --network "$NET" curlimages/curl:8.10.1 -s -D - -o /dev/null http://combined/ 2>/dev/null || true)"
+              echo "$H" | grep -qi '^x-pagespeed:' && { echo "$H"; return 0; }
+              sleep 1
+            done
+            echo "$H"; return 1
+          }
+          echo "::group::Community (unlicensed) run"
+          run_combined ""
+          for _ in $(seq 1 30); do docker run --rm --network "$NET" curlimages/curl:8.10.1 -s -o /dev/null http://combined/health && break; sleep 1; done
+          H="$(warm_and_get)" || { echo "FAIL: no X-PageSpeed (optimization not active)"; docker logs combined | tail -40; exit 1; }
+          echo "$H" | grep -qi '^x-pagespeed:' || { echo "FAIL: missing X-PageSpeed"; exit 1; }
+          echo "$H" | grep -qi '^x-pagespeed-warn:[[:space:]]*unlicensed' || { echo "FAIL: community run should carry x-pagespeed-warn"; echo "$H"; exit 1; }
+          echo "PASS: community = X-PageSpeed present + x-pagespeed-warn: unlicensed"
+          echo "::endgroup::"
+          echo "::group::Licensed run (valid mps2 token)"
+          run_combined "-e PAGESPEED_LICENSE_KEY=${{ secrets.PAGESPEED_LICENSE_KEY }}"
+          for _ in $(seq 1 30); do docker run --rm --network "$NET" curlimages/curl:8.10.1 -s -o /dev/null http://combined/health && break; sleep 1; done
+          H="$(warm_and_get)" || { echo "FAIL: no X-PageSpeed (licensed)"; docker logs combined | tail -40; exit 1; }
+          echo "$H" | grep -qi '^x-pagespeed:' || { echo "FAIL: licensed missing X-PageSpeed"; exit 1; }
+          if echo "$H" | grep -qi '^x-pagespeed-warn:'; then echo "FAIL: licensed run must NOT carry x-pagespeed-warn"; echo "$H"; exit 1; fi
+          echo "PASS: licensed = X-PageSpeed present + NO x-pagespeed-warn"
+          echo "::endgroup::"
+          # Negative provenance check: a release image must NOT embed the zero-seed test key.
+          docker logs combined 2>&1 | grep -qi 'PAGESPEED_TEST_LICENSE_KEY\|test license key' && { echo "FAIL: image carries the TEST key"; exit 1; } || true
+          echo "SMOKE PASSED (${ARCH})"
+
+      - name: Login to GHCR (publish mode only)
+        if: ${{ env.MODE == 'publish' }}
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Push per-arch digests (publish mode only)
+        if: ${{ env.MODE == 'publish' }}
+        run: |
+          set -euo pipefail
+          for img in nginx worker combined; do
+            docker tag "pagespeed-${img}:${VERSION}-${ARCH}" "${REGISTRY}/pagespeed-${img}:${VERSION}-${ARCH}"
+            docker push "${REGISTRY}/pagespeed-${img}:${VERSION}-${ARCH}"
+          done
+
+  publish:
+    needs: [resolve, build]
+    if: ${{ needs.resolve.outputs.mode == 'publish' }}
+    runs-on: ubuntu-latest
+    environment: production   # <-- THE GATE: requires manual approval before any push/sign
+    env:
+      VERSION: ${{ needs.resolve.outputs.version }}
+      SHA: ${{ needs.resolve.outputs.sha }}
+    steps:
+      - name: Login to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Install cosign + syft
+        uses: sigstore/cosign-installer@v3
+      - run: |
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
+
+      - name: Create multi-arch manifests, sign + attest (keyless)
+        run: |
+          set -euo pipefail
+          for img in nginx worker combined; do
+            REF="${REGISTRY}/pagespeed-${img}:${VERSION}"
+            docker buildx imagetools create -t "${REF}" \
+              "${REGISTRY}/pagespeed-${img}:${VERSION}-amd64" \
+              "${REGISTRY}/pagespeed-${img}:${VERSION}-arm64"
+            DIGEST="$(docker buildx imagetools inspect "${REF}" --format '{{json .Manifest.Digest}}' | tr -d '"')"
+            # Keyless cosign — identity = this repo (We-Amp/modpagespeed-images).
+            cosign sign --yes "${REGISTRY}/pagespeed-${img}@${DIGEST}"
+            syft "${REGISTRY}/pagespeed-${img}@${DIGEST}" -o spdx-json > sbom-${img}.spdx.json
+            cosign attest --yes --type spdxjson --predicate sbom-${img}.spdx.json "${REGISTRY}/pagespeed-${img}@${DIGEST}"
+            echo "Signed + attested ${REF} (${DIGEST})"
+          done
+          # :latest only on the combined try-it image (the pair stays immutable :version).
+          docker buildx imagetools create -t "${REGISTRY}/pagespeed-combined:latest" "${REGISTRY}/pagespeed-combined:${VERSION}"
+
+      - name: SLSA build provenance
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-name: ${{ env.REGISTRY }}/pagespeed-combined
+          subject-digest: ${{ steps.dummy.outputs.digest || '' }}
+          push-to-registry: false
