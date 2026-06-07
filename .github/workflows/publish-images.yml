@@ -233,23 +233,31 @@ jobs:
           docker buildx imagetools create -t "${REGISTRY}/pagespeed-combined:latest" "${REGISTRY}/pagespeed-combined:${VERSION}"
 
       # SLSA build provenance, attached to each image by manifest digest
-      # (push-to-registry so consumers can `cosign verify-attestation` / `gh
-      # attestation verify` the GHCR image directly). One step per image —
-      # attest-build-provenance takes a single subject per invocation.
+      # (push-to-registry so consumers can `gh attestation verify` the GHCR
+      # image directly). One step per image — attest-build-provenance takes a
+      # single subject per invocation.
+      # continue-on-error: GitHub's attestation API requires a public repo or a
+      # paid plan; on a free private repo it returns "Feature not available".
+      # The keyless cosign signatures + SBOM attestations above do NOT use that
+      # API and are unaffected, so a missing SLSA attestation must not fail the
+      # publish. Make this repo public (or upgrade the plan) to light it up.
       - name: SLSA build provenance — nginx
         uses: actions/attest-build-provenance@v1
+        continue-on-error: true
         with:
           subject-name: ${{ env.REGISTRY }}/pagespeed-nginx
           subject-digest: ${{ steps.sign.outputs.digest_nginx }}
           push-to-registry: true
       - name: SLSA build provenance — worker
         uses: actions/attest-build-provenance@v1
+        continue-on-error: true
         with:
           subject-name: ${{ env.REGISTRY }}/pagespeed-worker
           subject-digest: ${{ steps.sign.outputs.digest_worker }}
           push-to-registry: true
       - name: SLSA build provenance — combined
         uses: actions/attest-build-provenance@v1
+        continue-on-error: true
         with:
           subject-name: ${{ env.REGISTRY }}/pagespeed-combined
           subject-digest: ${{ steps.sign.outputs.digest_combined }}
