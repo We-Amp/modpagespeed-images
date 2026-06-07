@@ -169,6 +169,18 @@ jobs:
           docker logs combined 2>&1 | grep -qi 'PAGESPEED_TEST_LICENSE_KEY\|test license key' && { echo "FAIL: image carries the TEST key"; exit 1; } || true
           echo "SMOKE PASSED (${ARCH})"
 
+      - name: CVE scan (grype, report-only — never gates)
+        if: always()
+        working-directory: product
+        run: |
+          set -uo pipefail
+          curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin
+          for img in nginx worker combined; do
+            echo "::group::grype pagespeed-${img}:${VERSION}-${ARCH}"
+            grype "pagespeed-${img}:${VERSION}-${ARCH}" --add-cpes-if-none -o table || true
+            echo "::endgroup::"
+          done
+
       - name: Login to GHCR (publish mode only)
         if: ${{ env.MODE == 'publish' }}
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
@@ -199,7 +211,8 @@ jobs:
       - run: |
           curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
 
-      - name: Create multi-arch manifests, sign + attest (keyless)
+      - name: Create multi-arch manifests, sign + SBOM-attest (keyless)
+        id: sign
         run: |
           set -euo pipefail
           for img in nginx worker combined; do
@@ -212,14 +225,32 @@ jobs:
             cosign sign --yes "${REGISTRY}/pagespeed-${img}@${DIGEST}"
             syft "${REGISTRY}/pagespeed-${img}@${DIGEST}" -o spdx-json > sbom-${img}.spdx.json
             cosign attest --yes --type spdxjson --predicate sbom-${img}.spdx.json "${REGISTRY}/pagespeed-${img}@${DIGEST}"
-            echo "Signed + attested ${REF} (${DIGEST})"
+            # Expose each manifest digest for the per-image SLSA provenance steps.
+            echo "digest_${img}=${DIGEST}" >> "$GITHUB_OUTPUT"
+            echo "Signed + SBOM-attested ${REF} (${DIGEST})"
           done
           # :latest only on the combined try-it image (the pair stays immutable :version).
           docker buildx imagetools create -t "${REGISTRY}/pagespeed-combined:latest" "${REGISTRY}/pagespeed-combined:${VERSION}"
 
-      - name: SLSA build provenance
+      # SLSA build provenance, attached to each image by manifest digest
+      # (push-to-registry so consumers can `cosign verify-attestation` / `gh
+      # attestation verify` the GHCR image directly). One step per image —
+      # attest-build-provenance takes a single subject per invocation.
+      - name: SLSA build provenance — nginx
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-name: ${{ env.REGISTRY }}/pagespeed-nginx
+          subject-digest: ${{ steps.sign.outputs.digest_nginx }}
+          push-to-registry: true
+      - name: SLSA build provenance — worker
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-name: ${{ env.REGISTRY }}/pagespeed-worker
+          subject-digest: ${{ steps.sign.outputs.digest_worker }}
+          push-to-registry: true
+      - name: SLSA build provenance — combined
         uses: actions/attest-build-provenance@v1
         with:
           subject-name: ${{ env.REGISTRY }}/pagespeed-combined
-          subject-digest: ${{ steps.dummy.outputs.digest || '' }}
-          push-to-registry: false
+          subject-digest: ${{ steps.sign.outputs.digest_combined }}
+          push-to-registry: true
