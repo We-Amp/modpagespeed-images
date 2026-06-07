@@ -67,12 +67,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # gcs_arch maps the Docker platform name to release.yml's GCS path
+          # convention (linux-x64 / linux-arm64), which differs for amd64.
           - arch: amd64
+            gcs_arch: x64
             runs-on: ubuntu-latest
           # arm64: GitHub-hosted arm64 Linux runner (needs Team/Enterprise plan;
           # swap to a self-hosted arm64 runner if unavailable). fail-fast=false
           # so amd64 validates independently of arm64 availability.
           - arch: arm64
+            gcs_arch: arm64
             runs-on: ubuntu-24.04-arm
     runs-on: ${{ matrix.runs-on }}
     env:
@@ -80,6 +84,7 @@ jobs:
       SHA: ${{ needs.resolve.outputs.sha }}
       MODE: ${{ needs.resolve.outputs.mode }}
       ARCH: ${{ matrix.arch }}
+      GCS_ARCH: ${{ matrix.gcs_arch }}
     steps:
       - name: Checkout product repo at the release SHA
         uses: actions/checkout@v4
@@ -95,7 +100,7 @@ jobs:
           echo '${{ secrets.GCS_ARTIFACTS_KEY }}' > /tmp/gcs-key-$ARCH.json
           gcloud auth activate-service-account --key-file=/tmp/gcs-key-$ARCH.json
           mkdir -p product/artifacts
-          SRC="gs://weamp-release-artifacts/release/${SHA}/linux-${ARCH}"
+          SRC="gs://weamp-release-artifacts/release/${SHA}/linux-${GCS_ARCH}"
           for f in factory_worker ngx_pagespeed_module.so nginx-version; do
             gcloud storage cp "${SRC}/${f}" "product/artifacts/${f}"
           done
