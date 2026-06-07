@@ -97,22 +97,28 @@ jobs:
       - name: Download CI-built artifacts from the permanent bucket
         run: |
           set -euo pipefail
-          echo '${{ secrets.GCS_ARTIFACTS_KEY }}' > /tmp/gcs-key-$ARCH.json
-          gcloud auth activate-service-account --key-file=/tmp/gcs-key-$ARCH.json
+          KEY="/tmp/gcs-key-$ARCH.json"
+          # Remove the SA key on ANY exit (incl. a failed gcloud cp under set -e),
+          # so it never lingers on the runner's /tmp for a later step/job to read.
+          trap 'rm -f "$KEY"' EXIT
+          echo '${{ secrets.GCS_ARTIFACTS_KEY }}' > "$KEY"
+          gcloud auth activate-service-account --key-file="$KEY"
           mkdir -p product/artifacts
           SRC="gs://weamp-release-artifacts/release/${SHA}/linux-${GCS_ARCH}"
           for f in factory_worker ngx_pagespeed_module.so nginx-version; do
             gcloud storage cp "${SRC}/${f}" "product/artifacts/${f}"
           done
           chmod +x product/artifacts/factory_worker
-          rm -f /tmp/gcs-key-$ARCH.json
           echo "module built against nginx $(cat product/artifacts/nginx-version)"
 
       - name: Build base-runtime + the three images
         working-directory: product
         run: |
           set -euo pipefail
-          BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          # Deterministic: the release commit's own timestamp (RFC3339), NOT
+          # wall-clock — so rebuilding the same SHA yields identical image bytes
+          # (the org.opencontainers.image.created label is part of the digest).
+          BUILD_DATE="$(git -C "${GITHUB_WORKSPACE}/product" show -s --format=%cI "$SHA")"
           docker build -f docker/Dockerfile.base-runtime -t pagespeed2-base-runtime .
           for img in nginx worker combined; do
             docker build \
