@@ -40,7 +40,5 @@ gh attestation verify oci://ghcr.io/we-amp/pagespeed-combined:latest \
 
 ## License
 
-Using these images accepts the [Terms of Service](https://modpagespeed.com/terms/). The
-images run unlicensed in community mode — the worker keeps optimizing and adds an
-`X-PageSpeed-Warn: unlicensed` header; a license removes the warning. See
-[modpagespeed.com/pricing](https://modpagespeed.com/pricing/).
+Using these images accepts the [Terms of Service](https://modpagespeed.com/terms/). Since
+2.1 the images need no license key and add no license warning header.
