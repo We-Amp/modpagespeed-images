@@ -26,6 +26,11 @@ docker run --rm -p 80:80 \
 See the [Docker install guide](https://modpagespeed.com/docs/installation-docker/) for the
 production (separate worker + nginx) setup, Helm, and configuration.
 
+Agent install recipes:
+
+- Docker (all three images): https://modpagespeed.com/recipes/docker.md
+- Helm (the nginx and worker images): https://modpagespeed.com/recipes/helm.md
+
 ## Verifying images
 
 ```bash
