@@ -25,6 +25,14 @@ on:
         type: choice
         options: [dry-run, publish]
         default: dry-run
+      source_tag:
+        description: "Optional public source tag, e.g. optimizer-v1.18.0 (use together with source_sha)"
+        required: false
+        default: ""
+      source_sha:
+        description: "Optional 40-char commit SHA of We-Amp/pagespeed-optimizer to build the images from (must be the commit source_tag points at)"
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -43,23 +51,39 @@ jobs:
       version: ${{ steps.r.outputs.version }}
       sha: ${{ steps.r.outputs.sha }}
       mode: ${{ steps.r.outputs.mode }}
+      source_tag: ${{ steps.r.outputs.source_tag }}
+      source_sha: ${{ steps.r.outputs.source_sha }}
     steps:
       - id: r
+        env:
+          IN_SOURCE_TAG_DISPATCH: ${{ github.event.client_payload.source_tag }}
+          IN_SOURCE_SHA_DISPATCH: ${{ github.event.client_payload.source_sha }}
+          IN_SOURCE_TAG_MANUAL: ${{ inputs.source_tag }}
+          IN_SOURCE_SHA_MANUAL: ${{ inputs.source_sha }}
         run: |
           set -euo pipefail
           if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
             V='${{ github.event.client_payload.version }}'
             S='${{ github.event.client_payload.sha }}'
             M='dry-run'   # release dispatch always builds+smokes; publish is gated
+            ST="$IN_SOURCE_TAG_DISPATCH"; SS="$IN_SOURCE_SHA_DISPATCH"
           else
             V='${{ inputs.version }}'; S='${{ inputs.sha }}'; M='${{ inputs.mode }}'
+            ST="$IN_SOURCE_TAG_MANUAL"; SS="$IN_SOURCE_SHA_MANUAL"
           fi
           V="${V#v}"   # strip a leading v
           [ -n "$V" ] && [ -n "$S" ] || { echo "missing version/sha"; exit 1; }
           echo "version=$V" >> "$GITHUB_OUTPUT"
           echo "sha=$S" >> "$GITHUB_OUTPUT"
           echo "mode=$M" >> "$GITHUB_OUTPUT"
-          echo "Resolved version=$V sha=$S mode=$M"
+          # Optional public source: both or neither, in a strict format.
+          if [ -n "$SS" ] || [ -n "$ST" ]; then
+            printf '%s' "$SS" | grep -Eq '^[0-9a-f]{40}$' || { echo "source_sha must be a 40-char lowercase hex SHA"; exit 1; }
+            printf '%s' "$ST" | grep -Eq '^[A-Za-z0-9._-]+$' || { echo "source_tag is required with source_sha (letters, digits, . _ - only)"; exit 1; }
+          fi
+          echo "source_tag=$ST" >> "$GITHUB_OUTPUT"
+          echo "source_sha=$SS" >> "$GITHUB_OUTPUT"
+          echo "Resolved version=$V sha=$S mode=$M source_tag=${ST:-none} source_sha=${SS:-none}"
 
   build:
     needs: resolve
@@ -83,16 +107,44 @@ jobs:
       VERSION: ${{ needs.resolve.outputs.version }}
       SHA: ${{ needs.resolve.outputs.sha }}
       MODE: ${{ needs.resolve.outputs.mode }}
+      SOURCE_TAG: ${{ needs.resolve.outputs.source_tag }}
+      SOURCE_SHA: ${{ needs.resolve.outputs.source_sha }}
       ARCH: ${{ matrix.arch }}
       GCS_ARCH: ${{ matrix.gcs_arch }}
     steps:
       - name: Checkout product repo at the release SHA
+        if: ${{ env.SOURCE_SHA == '' }}
         uses: actions/checkout@v4
         with:
           repository: oschaaf/modpagespeed-2
           ref: ${{ env.SHA }}
           token: ${{ secrets.PRODUCT_REPO_TOKEN }}
           path: product
+
+      # Public source: no token, no stored credentials.
+      - name: Checkout the public source at source_sha
+        if: ${{ env.SOURCE_SHA != '' }}
+        uses: actions/checkout@v4
+        with:
+          repository: We-Amp/pagespeed-optimizer
+          ref: ${{ env.SOURCE_SHA }}
+          persist-credentials: false
+          path: product
+
+      - name: Verify the public source tag points at source_sha
+        if: ${{ env.SOURCE_SHA != '' }}
+        run: |
+          set -euo pipefail
+          # An annotated tag lists the tag object and its peeled commit (^{});
+          # a lightweight tag lists only the commit. The last line is the commit.
+          REMOTE="$(git ls-remote https://github.com/We-Amp/pagespeed-optimizer.git \
+            "refs/tags/${SOURCE_TAG}" "refs/tags/${SOURCE_TAG}^{}")"
+          [ -n "$REMOTE" ] || { echo "tag ${SOURCE_TAG} not found"; exit 1; }
+          PEELED="$(printf '%s\n' "$REMOTE" | tail -n1 | cut -f1)"
+          HEAD_SHA="$(git -C "${GITHUB_WORKSPACE}/product" rev-parse HEAD)"
+          [ "$PEELED" = "$SOURCE_SHA" ] || { echo "tag ${SOURCE_TAG} resolves to ${PEELED}, not ${SOURCE_SHA}"; exit 1; }
+          [ "$HEAD_SHA" = "$SOURCE_SHA" ] || { echo "checkout HEAD ${HEAD_SHA} is not ${SOURCE_SHA}"; exit 1; }
+          echo "OK: ${SOURCE_TAG} -> ${SOURCE_SHA}"
 
       - name: Download CI-built artifacts from the permanent bucket
         run: |
@@ -118,14 +170,17 @@ jobs:
           # Deterministic: the release commit's own timestamp (RFC3339), NOT
           # wall-clock — so rebuilding the same SHA yields identical image bytes
           # (the org.opencontainers.image.created label is part of the digest).
-          BUILD_DATE="$(git -C "${GITHUB_WORKSPACE}/product" show -s --format=%cI "$SHA")"
+          # With a public source, the date and revision come from that public
+          # commit; otherwise from the release SHA as before.
+          REV="${SOURCE_SHA:-$SHA}"
+          BUILD_DATE="$(git -C "${GITHUB_WORKSPACE}/product" show -s --format=%cI "$REV")"
           docker build -f docker/Dockerfile.base-runtime -t pagespeed2-base-runtime .
           for img in nginx worker combined; do
             docker build \
               -f "docker/Dockerfile.${img}.prebuilt" \
               --build-arg VERSION="${VERSION}" \
               --build-arg BUILD_DATE="${BUILD_DATE}" \
-              --build-arg SOURCE_REVISION="${SHA}" \
+              --build-arg SOURCE_REVISION="${REV}" \
               -t "pagespeed-${img}:${VERSION}-${ARCH}" .
           done
 
