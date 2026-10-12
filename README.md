@@ -43,6 +43,16 @@ gh attestation verify oci://ghcr.io/we-amp/pagespeed-combined:latest \
   --repo We-Amp/modpagespeed-images
 ```
 
+## Building from a public source tag
+
+The publish workflow accepts two optional inputs, `source_tag` and `source_sha`
+(also read from the release dispatch payload). When `source_sha` is set, the
+images are built from the public [pagespeed-optimizer](https://github.com/We-Amp/pagespeed-optimizer)
+source at that commit, checked out without credentials. The workflow first
+verifies that `source_tag` points at exactly that commit and fails otherwise.
+The image creation date and source revision labels then come from that public
+commit. Without these inputs the workflow behaves as before.
+
 ## License
 
 Using these images accepts the [Terms of Service](https://modpagespeed.com/terms/). Since
