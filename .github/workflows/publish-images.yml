@@ -1,12 +1,19 @@
-# Build, smoke, sign + publish the ModPageSpeed 2.0 public container images.
-# ADR-090. Assembles images from CI-built artifacts (no Bazel/Chromium here):
-# the product release.yml archives the Docker-flavored trio to
-# gs://weamp-release-artifacts/release/<sha>/<arch>/ and dispatches here.
+# Build, smoke, sign and publish the ModPageSpeed 2.0 public container images.
+# The images are assembled from the Docker-flavored artifacts that the product
+# release run builds (docker-artifacts-linux-x64 and -arm64); there is no
+# Bazel or Chromium here. The release run dispatches this workflow with its
+# own run id; every claim in that payload is re-checked against the GitHub
+# API before anything is built (see "Verify the provenance of the artifacts").
 #
-# REVERSIBILITY: `dry-run` mode builds + smokes only — zero registry/Rekor
-# footprint. The ghcr push + keyless cosign live in the `publish` job, gated by
-# the protected `production` environment (manual approval). The release dispatch
-# defaults to building + smoking; nothing is published without that approval.
+# REVERSIBILITY: `dry-run` mode builds and smokes only, with zero registry or
+# transparency-log footprint. In `publish` mode nothing reaches the registry
+# until the protected `production` environment is approved: the build jobs
+# only save the images as short-lived workflow artifacts, and the gated
+# `publish` job loads, pushes, signs and attests them.
+#
+# ARTIFACTS_READ_TOKEN is a read-only token (Actions + Metadata, the release
+# repository only). It is used on hosted runners only, to read the release
+# run and download its artifacts across repositories.
 name: publish-images
 
 on:
@@ -15,75 +22,182 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Release version, e.g. 2.0.21"
-        required: true
-      sha:
-        description: "Full 40-char product commit SHA (keys the GCS artifact path)"
+        description: "Release version, e.g. 2.5.0"
         required: true
       mode:
         description: "dry-run (build+smoke only) or publish (push+sign, gated)"
         type: choice
         options: [dry-run, publish]
         default: dry-run
+      artifacts_repository:
+        description: "Repository whose release run built the artifacts (only We-Amp/pagespeed-optimizer is accepted)"
+        required: true
+        default: We-Amp/pagespeed-optimizer
+      run_id:
+        description: "Id of the release run that built docker-artifacts-linux-x64 and -arm64"
+        required: true
       source_tag:
-        description: "Optional public source tag, e.g. optimizer-v1.18.0 (use together with source_sha)"
-        required: false
-        default: ""
+        description: "Public release tag, e.g. v2.5.0 (must be the tag the run was triggered by)"
+        required: true
       source_sha:
-        description: "Optional 40-char commit SHA of We-Amp/pagespeed-optimizer to build the images from (must be the commit source_tag points at)"
-        required: false
-        default: ""
+        description: "40-char commit SHA that source_tag points at"
+        required: true
 
 permissions:
   contents: read
-  packages: write
-  id-token: write
-  attestations: write
 
 env:
   REGISTRY: ghcr.io/we-amp
-  PRODUCT_REPO: oschaaf/modpagespeed-2
+  # The only repository the artifacts may come from.
+  ALLOWED_ARTIFACTS_REPO: We-Amp/pagespeed-optimizer
 
 jobs:
   resolve:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.r.outputs.version }}
-      sha: ${{ steps.r.outputs.sha }}
       mode: ${{ steps.r.outputs.mode }}
       source_tag: ${{ steps.r.outputs.source_tag }}
       source_sha: ${{ steps.r.outputs.source_sha }}
+      artifacts_repository: ${{ steps.r.outputs.artifacts_repository }}
+      run_id: ${{ steps.r.outputs.run_id }}
+      run_url: ${{ steps.verify.outputs.run_url }}
     steps:
       - id: r
         env:
+          EVENT_NAME: ${{ github.event_name }}
+          IN_VERSION_DISPATCH: ${{ github.event.client_payload.version }}
+          IN_REPO_DISPATCH: ${{ github.event.client_payload.artifacts_repository }}
+          IN_RUN_DISPATCH: ${{ github.event.client_payload.run_id }}
           IN_SOURCE_TAG_DISPATCH: ${{ github.event.client_payload.source_tag }}
           IN_SOURCE_SHA_DISPATCH: ${{ github.event.client_payload.source_sha }}
+          IN_VERSION_MANUAL: ${{ inputs.version }}
+          IN_MODE_MANUAL: ${{ inputs.mode }}
+          IN_REPO_MANUAL: ${{ inputs.artifacts_repository }}
+          IN_RUN_MANUAL: ${{ inputs.run_id }}
           IN_SOURCE_TAG_MANUAL: ${{ inputs.source_tag }}
           IN_SOURCE_SHA_MANUAL: ${{ inputs.source_sha }}
         run: |
           set -euo pipefail
-          if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
-            V='${{ github.event.client_payload.version }}'
-            S='${{ github.event.client_payload.sha }}'
-            M='dry-run'   # release dispatch always builds+smokes; publish is gated
+          if [ "$EVENT_NAME" = "repository_dispatch" ]; then
+            V="$IN_VERSION_DISPATCH"; AR="$IN_REPO_DISPATCH"; RID="$IN_RUN_DISPATCH"
             ST="$IN_SOURCE_TAG_DISPATCH"; SS="$IN_SOURCE_SHA_DISPATCH"
+            M='publish'   # the `production` environment on `publish` is the gate
           else
-            V='${{ inputs.version }}'; S='${{ inputs.sha }}'; M='${{ inputs.mode }}'
-            ST="$IN_SOURCE_TAG_MANUAL"; SS="$IN_SOURCE_SHA_MANUAL"
+            V="$IN_VERSION_MANUAL"; AR="$IN_REPO_MANUAL"; RID="$IN_RUN_MANUAL"
+            ST="$IN_SOURCE_TAG_MANUAL"; SS="$IN_SOURCE_SHA_MANUAL"; M="$IN_MODE_MANUAL"
           fi
           V="${V#v}"   # strip a leading v
-          [ -n "$V" ] && [ -n "$S" ] || { echo "missing version/sha"; exit 1; }
-          echo "version=$V" >> "$GITHUB_OUTPUT"
-          echo "sha=$S" >> "$GITHUB_OUTPUT"
-          echo "mode=$M" >> "$GITHUB_OUTPUT"
-          # Optional public source: both or neither, in a strict format.
-          if [ -n "$SS" ] || [ -n "$ST" ]; then
-            printf '%s' "$SS" | grep -Eq '^[0-9a-f]{40}$' || { echo "source_sha must be a 40-char lowercase hex SHA"; exit 1; }
-            printf '%s' "$ST" | grep -Eq '^[A-Za-z0-9._-]+$' || { echo "source_tag is required with source_sha (letters, digits, . _ - only)"; exit 1; }
+          # Format checks only; what the values mean is verified in the next step.
+          printf '%s' "$V" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' || { echo "::error::version must look like 2.5.0"; exit 1; }
+          printf '%s' "$RID" | grep -Eq '^[0-9]{1,20}$' || { echo "::error::run_id must be a number"; exit 1; }
+          printf '%s' "$SS" | grep -Eq '^[0-9a-f]{40}$' || { echo "::error::source_sha must be a 40-char lowercase hex SHA"; exit 1; }
+          printf '%s' "$ST" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$' || { echo "::error::source_tag must look like v2.5.0"; exit 1; }
+          case "$M" in dry-run|publish) ;; *) echo "::error::mode must be dry-run or publish"; exit 1 ;; esac
+          {
+            echo "version=$V"; echo "mode=$M"; echo "source_tag=$ST"; echo "source_sha=$SS"
+            echo "artifacts_repository=$AR"; echo "run_id=$RID"
+          } >> "$GITHUB_OUTPUT"
+          echo "Resolved version=$V mode=$M source_tag=$ST source_sha=$SS artifacts_repository=$AR run_id=$RID"
+
+      # Nothing from the payload is trusted: every value is compared to a
+      # constant or to what the GitHub API says about the release run.
+      # All failures are collected and printed together.
+      - name: Verify the provenance of the artifacts
+        id: verify
+        env:
+          GH_TOKEN: ${{ secrets.ARTIFACTS_READ_TOKEN }}
+          VERSION: ${{ steps.r.outputs.version }}
+          MODE: ${{ steps.r.outputs.mode }}
+          SOURCE_TAG: ${{ steps.r.outputs.source_tag }}
+          SOURCE_SHA: ${{ steps.r.outputs.source_sha }}
+          ARTIFACTS_REPO: ${{ steps.r.outputs.artifacts_repository }}
+          RUN_ID: ${{ steps.r.outputs.run_id }}
+        run: |
+          set -euo pipefail
+          FAILS=0
+          bad() { echo "::error::provenance: $*"; FAILS=$((FAILS + 1)); }
+
+          # 1. The repository is a hard-coded allowlist (checked before any
+          #    API call, so the token is never pointed at another repository).
+          if [ "$ARTIFACTS_REPO" != "$ALLOWED_ARTIFACTS_REPO" ]; then
+            echo "::error::provenance: artifacts_repository '$ARTIFACTS_REPO' is not allowed (only $ALLOWED_ARTIFACTS_REPO)"
+            exit 1
           fi
-          echo "source_tag=$ST" >> "$GITHUB_OUTPUT"
-          echo "source_sha=$SS" >> "$GITHUB_OUTPUT"
-          echo "Resolved version=$V sha=$S mode=$M source_tag=${ST:-none} source_sha=${SS:-none}"
+          [ -n "$GH_TOKEN" ] || { echo "::error::ARTIFACTS_READ_TOKEN is not set; the release artifacts cannot be read"; exit 1; }
+          [ "$SOURCE_TAG" = "v${VERSION}" ] || bad "source_tag '$SOURCE_TAG' is not v${VERSION}"
+
+          # 2. The run itself.
+          RUN="$(gh api "repos/${ALLOWED_ARTIFACTS_REPO}/actions/runs/${RUN_ID}")" \
+            || { echo "::error::provenance: run ${RUN_ID} not found in ${ALLOWED_ARTIFACTS_REPO}"; exit 1; }
+          field() { printf '%s' "$RUN" | jq -r "$1"; }
+          [ "$(field .repository.full_name)" = "$ALLOWED_ARTIFACTS_REPO" ] || bad "run repository is '$(field .repository.full_name)'"
+          [ "$(field .head_repository.full_name)" = "$ALLOWED_ARTIFACTS_REPO" ] || bad "run head repository is '$(field .head_repository.full_name)' (a fork?)"
+          [ "$(field .path)" = ".github/workflows/release.yml" ] || bad "run workflow is '$(field .path)', not .github/workflows/release.yml"
+          RUN_EVENT="$(field .event)"
+          NUGET_REF="${ALLOWED_ARTIFACTS_REPO}/.github/workflows/pipeline-release-nuget.yml@"
+          printf '%s' "$RUN" | jq -e --arg p "$NUGET_REF" \
+            '[.referenced_workflows[]? | select((.path | startswith($p)) and .ref == "refs/heads/main")] | length > 0' >/dev/null \
+            || bad "run does not call pipeline-release-nuget.yml from refs/heads/main"
+          [ "$(field .head_branch)" = "$SOURCE_TAG" ] || bad "run head_branch is '$(field .head_branch)', not $SOURCE_TAG"
+          [ "$(field .head_sha)" = "$SOURCE_SHA" ] || bad "run head_sha is '$(field .head_sha)', not $SOURCE_SHA"
+          if [ "$RUN_EVENT" = "push" ]; then
+            printf '%s' "$RUN" | jq -e --arg p "$NUGET_REF" --arg s "$SOURCE_SHA" \
+              '[.referenced_workflows[]? | select((.path | startswith($p)) and .sha == $s)] | length > 0' >/dev/null \
+              || bad "pipeline-release-nuget.yml was not called at $SOURCE_SHA"
+          fi
+
+          # 3. Publishing needs a real tag run; rehearsals may use a dispatch.
+          if [ "$MODE" = "publish" ] && [ "$RUN_EVENT" != "push" ]; then
+            bad "publish mode needs a run triggered by a tag push, this run's event is '$RUN_EVENT'"
+          fi
+          if [ "$RUN_EVENT" != "push" ] && [ "$RUN_EVENT" != "workflow_dispatch" ]; then
+            bad "run event '$RUN_EVENT' is not a tag push or a dispatch"
+          fi
+
+          # 4. The two Linux release builds succeeded. The run itself may
+          #    still be in progress (it is when it dispatches here), so its
+          #    own conclusion is not required.
+          JOBS="$(gh api "repos/${ALLOWED_ARTIFACTS_REPO}/actions/runs/${RUN_ID}/jobs?per_page=100")"
+          for J in "nuget / Linux Release Build" "nuget / Linux arm64 Release Build"; do
+            printf '%s' "$JOBS" | jq -e --arg j "$J" \
+              '[.jobs[] | select((.name == $j or .name == ($j + " (hosted)")) and .conclusion == "success")] | length > 0' >/dev/null \
+              || bad "job '$J' did not succeed in run ${RUN_ID}"
+          done
+
+          # 5. The tag peels to source_sha on the public remote. An annotated
+          #    tag lists the tag object and its peeled commit (^{}); a
+          #    lightweight tag lists only the commit. The last line is the commit.
+          REMOTE="$(git ls-remote "https://github.com/${ALLOWED_ARTIFACTS_REPO}.git" \
+            "refs/tags/${SOURCE_TAG}" "refs/tags/${SOURCE_TAG}^{}")"
+          if [ -z "$REMOTE" ]; then
+            bad "tag ${SOURCE_TAG} not found on the public remote"
+          else
+            PEELED="$(printf '%s\n' "$REMOTE" | tail -n1 | cut -f1)"
+            [ "$PEELED" = "$SOURCE_SHA" ] || bad "tag ${SOURCE_TAG} resolves to ${PEELED}, not ${SOURCE_SHA}"
+          fi
+
+          # 6. Both artifacts exist and are not expired; record their digests.
+          ARTS="$(gh api "repos/${ALLOWED_ARTIFACTS_REPO}/actions/runs/${RUN_ID}/artifacts?per_page=100")"
+          for A in docker-artifacts-linux-x64 docker-artifacts-linux-arm64; do
+            D="$(printf '%s' "$ARTS" | jq -r --arg a "$A" '[.artifacts[] | select(.name == $a and .expired == false)][0].digest // empty')"
+            if printf '%s' "$D" | grep -Eq '^sha256:[0-9a-f]{64}$'; then
+              echo "artifact $A $D"
+            else
+              bad "artifact $A is missing, expired or has no digest"
+            fi
+          done
+
+          [ "$FAILS" -eq 0 ] || { echo "::error::provenance verification failed (${FAILS} problem(s)); nothing was built"; exit 1; }
+          RUN_URL="https://github.com/${ALLOWED_ARTIFACTS_REPO}/actions/runs/${RUN_ID}"
+          echo "run_url=$RUN_URL" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Provenance verified"
+            echo "- release run: $RUN_URL (event: $RUN_EVENT)"
+            echo "- tag: \`$SOURCE_TAG\` -> \`$SOURCE_SHA\`"
+            echo "- mode: $MODE"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "OK: run ${RUN_ID} is the ${SOURCE_TAG} release run"
 
   build:
     needs: resolve
@@ -91,100 +205,91 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # gcs_arch maps the Docker platform name to release.yml's GCS path
-          # convention (linux-x64 / linux-arm64), which differs for amd64.
+          # art_arch maps the Docker platform name to the artifact suffix
+          # (docker-artifacts-linux-x64 / -arm64), which differs for amd64.
           - arch: amd64
-            gcs_arch: x64
+            art_arch: x64
             runs-on: ubuntu-latest
-          # arm64: GitHub-hosted arm64 Linux runner (needs Team/Enterprise plan;
-          # swap to a self-hosted arm64 runner if unavailable). fail-fast=false
-          # so amd64 validates independently of arm64 availability.
+          # arm64: GitHub-hosted arm64 Linux runner. fail-fast=false so amd64
+          # validates independently of arm64 availability.
           - arch: arm64
-            gcs_arch: arm64
+            art_arch: arm64
             runs-on: ubuntu-24.04-arm
     runs-on: ${{ matrix.runs-on }}
     env:
       VERSION: ${{ needs.resolve.outputs.version }}
-      SHA: ${{ needs.resolve.outputs.sha }}
       MODE: ${{ needs.resolve.outputs.mode }}
       SOURCE_TAG: ${{ needs.resolve.outputs.source_tag }}
       SOURCE_SHA: ${{ needs.resolve.outputs.source_sha }}
+      RUN_URL: ${{ needs.resolve.outputs.run_url }}
       ARCH: ${{ matrix.arch }}
-      GCS_ARCH: ${{ matrix.gcs_arch }}
     steps:
-      - name: Checkout product repo at the release SHA
-        if: ${{ env.SOURCE_SHA == '' }}
-        uses: actions/checkout@v4
-        with:
-          repository: oschaaf/modpagespeed-2
-          ref: ${{ env.SHA }}
-          token: ${{ secrets.PRODUCT_REPO_TOKEN }}
-          path: product
-
       # Public source: no token, no stored credentials.
       - name: Checkout the public source at source_sha
-        if: ${{ env.SOURCE_SHA != '' }}
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: We-Amp/pagespeed-optimizer
           ref: ${{ env.SOURCE_SHA }}
           persist-credentials: false
           path: product
 
-      - name: Verify the public source tag points at source_sha
-        if: ${{ env.SOURCE_SHA != '' }}
+      - name: Verify the checkout is source_sha
         run: |
           set -euo pipefail
-          # An annotated tag lists the tag object and its peeled commit (^{});
-          # a lightweight tag lists only the commit. The last line is the commit.
-          REMOTE="$(git ls-remote https://github.com/We-Amp/pagespeed-optimizer.git \
-            "refs/tags/${SOURCE_TAG}" "refs/tags/${SOURCE_TAG}^{}")"
-          [ -n "$REMOTE" ] || { echo "tag ${SOURCE_TAG} not found"; exit 1; }
-          PEELED="$(printf '%s\n' "$REMOTE" | tail -n1 | cut -f1)"
           HEAD_SHA="$(git -C "${GITHUB_WORKSPACE}/product" rev-parse HEAD)"
-          [ "$PEELED" = "$SOURCE_SHA" ] || { echo "tag ${SOURCE_TAG} resolves to ${PEELED}, not ${SOURCE_SHA}"; exit 1; }
           [ "$HEAD_SHA" = "$SOURCE_SHA" ] || { echo "checkout HEAD ${HEAD_SHA} is not ${SOURCE_SHA}"; exit 1; }
           echo "OK: ${SOURCE_TAG} -> ${SOURCE_SHA}"
 
-      - name: Download CI-built artifacts from the permanent bucket
+      # Cross-repository download: the action compares the artifact's digest
+      # with the one the API reports and fails on a mismatch.
+      - name: Download the release run's image artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: docker-artifacts-linux-${{ matrix.art_arch }}
+          repository: ${{ needs.resolve.outputs.artifacts_repository }}
+          run-id: ${{ needs.resolve.outputs.run_id }}
+          github-token: ${{ secrets.ARTIFACTS_READ_TOKEN }}
+          digest-mismatch: error
+          path: product/artifacts
+
+      - name: Record the artifact checksums
+        working-directory: product/artifacts
         run: |
           set -euo pipefail
-          KEY="/tmp/gcs-key-$ARCH.json"
-          # Remove the SA key on ANY exit (incl. a failed gcloud cp under set -e),
-          # so it never lingers on the runner's /tmp for a later step/job to read.
-          trap 'rm -f "$KEY"' EXIT
-          echo '${{ secrets.GCS_ARTIFACTS_KEY }}' > "$KEY"
-          gcloud auth activate-service-account --key-file="$KEY"
-          mkdir -p product/artifacts
-          SRC="gs://weamp-release-artifacts/release/${SHA}/linux-${GCS_ARCH}"
           for f in factory_worker ngx_pagespeed_module.so nginx-version; do
-            gcloud storage cp "${SRC}/${f}" "product/artifacts/${f}"
+            [ -f "$f" ] || { echo "::error::artifact is missing $f"; exit 1; }
           done
-          chmod +x product/artifacts/factory_worker
-          echo "module built against nginx $(cat product/artifacts/nginx-version)"
+          chmod +x factory_worker
+          echo "module built against nginx $(cat nginx-version)"
+          {
+            echo "### Artifact checksums (${ARCH})"
+            echo '```'
+            sha256sum factory_worker ngx_pagespeed_module.so nginx-version
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Build base-runtime + the three images
         working-directory: product
         run: |
           set -euo pipefail
-          # Deterministic: the release commit's own timestamp (RFC3339), NOT
-          # wall-clock — so rebuilding the same SHA yields identical image bytes
-          # (the org.opencontainers.image.created label is part of the digest).
-          # With a public source, the date and revision come from that public
-          # commit; otherwise from the release SHA as before.
-          REV="${SOURCE_SHA:-$SHA}"
-          BUILD_DATE="$(git -C "${GITHUB_WORKSPACE}/product" show -s --format=%cI "$REV")"
+          # Deterministic: the source commit's own timestamp (RFC3339), not
+          # wall-clock, so rebuilding the same commit yields identical image
+          # bytes (the org.opencontainers.image.created label is part of the
+          # digest).
+          BUILD_DATE="$(git -C "${GITHUB_WORKSPACE}/product" show -s --format=%cI "$SOURCE_SHA")"
           docker build -f docker/Dockerfile.base-runtime -t pagespeed2-base-runtime .
           for img in nginx worker combined; do
             docker build \
               -f "docker/Dockerfile.${img}.prebuilt" \
               --build-arg VERSION="${VERSION}" \
               --build-arg BUILD_DATE="${BUILD_DATE}" \
-              --build-arg SOURCE_REVISION="${REV}" \
+              --build-arg SOURCE_REVISION="${SOURCE_SHA}" \
+              --label "org.opencontainers.image.revision=${SOURCE_SHA}" \
+              --label "com.we-amp.release-run=${RUN_URL}" \
               -t "pagespeed-${img}:${VERSION}-${ARCH}" .
           done
 
-      - name: Smoke gate (combined image — optimize, no license warning)
+      - name: Smoke gate (combined image, optimize, no license warning)
         working-directory: product
         run: |
           set -euo pipefail
@@ -202,7 +307,7 @@ jobs:
               -e BACKEND_HOST=origin -e BACKEND_PORT=80 -e ACCEPT_EULA=Y $1 \
               "pagespeed-combined:${VERSION}-${ARCH}" >/dev/null
           }
-          warm_and_get() {  # poll until X-PageSpeed appears (ADR-068 async warm), capture headers
+          warm_and_get() {  # poll until X-PageSpeed appears (async warm-up), capture headers
             for _ in $(seq 1 40); do
               H="$(docker run --rm --network "$NET" curlimages/curl:8.10.1 -s -D - -o /dev/null http://combined/ 2>/dev/null || true)"
               echo "$H" | grep -qi '^x-pagespeed:' && { echo "$H"; return 0; }
@@ -222,47 +327,82 @@ jobs:
           echo "::endgroup::"
           echo "SMOKE PASSED (${ARCH})"
 
-      - name: CVE scan (grype, report-only — never gates)
+      - name: CVE scan (grype, report-only, never gates)
         if: always()
         working-directory: product
         run: |
           set -uo pipefail
-          curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin
+          # Installer and release are both pinned to the same tag.
+          GRYPE_VERSION=v0.121.0
+          curl -sSfL "https://raw.githubusercontent.com/anchore/grype/${GRYPE_VERSION}/install.sh" | sh -s -- -b /usr/local/bin "${GRYPE_VERSION}"
           for img in nginx worker combined; do
             echo "::group::grype pagespeed-${img}:${VERSION}-${ARCH}"
             grype "pagespeed-${img}:${VERSION}-${ARCH}" --add-cpes-if-none -o table || true
             echo "::endgroup::"
           done
 
-      - name: Login to GHCR (publish mode only)
-        if: ${{ env.MODE == 'publish' }}
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
-
-      - name: Push per-arch digests (publish mode only)
+      # Publish mode only: hand the smoked images to the gated `publish` job
+      # as a one-day workflow artifact. Nothing is pushed from here.
+      - name: Save the images for the gated publish job
         if: ${{ env.MODE == 'publish' }}
         run: |
           set -euo pipefail
-          for img in nginx worker combined; do
-            docker tag "pagespeed-${img}:${VERSION}-${ARCH}" "${REGISTRY}/pagespeed-${img}:${VERSION}-${ARCH}"
-            docker push "${REGISTRY}/pagespeed-${img}:${VERSION}-${ARCH}"
-          done
+          docker save \
+            "pagespeed-nginx:${VERSION}-${ARCH}" \
+            "pagespeed-worker:${VERSION}-${ARCH}" \
+            "pagespeed-combined:${VERSION}-${ARCH}" | gzip -1 > "${RUNNER_TEMP}/images-${ARCH}.tar.gz"
+          ls -lh "${RUNNER_TEMP}/images-${ARCH}.tar.gz"
+
+      - name: Upload the saved images
+        if: ${{ env.MODE == 'publish' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: images-${{ matrix.arch }}
+          path: ${{ runner.temp }}/images-${{ matrix.arch }}.tar.gz
+          retention-days: 1
+          if-no-files-found: error
 
   publish:
     needs: [resolve, build]
     if: ${{ needs.resolve.outputs.mode == 'publish' }}
     runs-on: ubuntu-latest
     environment: production   # <-- THE GATE: requires manual approval before any push/sign
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
     env:
       VERSION: ${{ needs.resolve.outputs.version }}
-      SHA: ${{ needs.resolve.outputs.sha }}
     steps:
+      - name: Download the saved images
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: images-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/images
+
       - name: Login to GHCR
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: echo "$GH_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Push the per-arch images
+        run: |
+          set -euo pipefail
+          for arch in amd64 arm64; do
+            gunzip -c "${RUNNER_TEMP}/images/images-${arch}.tar.gz" | docker load
+            for img in nginx worker combined; do
+              docker tag "pagespeed-${img}:${VERSION}-${arch}" "${REGISTRY}/pagespeed-${img}:${VERSION}-${arch}"
+              docker push "${REGISTRY}/pagespeed-${img}:${VERSION}-${arch}"
+            done
+          done
 
       - name: Install cosign + syft
-        uses: sigstore/cosign-installer@v3
+        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
       - run: |
-          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
+          SYFT_VERSION=v1.55.0
+          curl -sSfL "https://raw.githubusercontent.com/anchore/syft/${SYFT_VERSION}/install.sh" | sh -s -- -b /usr/local/bin "${SYFT_VERSION}"
 
       - name: Create multi-arch manifests, sign + SBOM-attest (keyless)
         id: sign
@@ -274,7 +414,7 @@ jobs:
               "${REGISTRY}/pagespeed-${img}:${VERSION}-amd64" \
               "${REGISTRY}/pagespeed-${img}:${VERSION}-arm64"
             DIGEST="$(docker buildx imagetools inspect "${REF}" --format '{{json .Manifest.Digest}}' | tr -d '"')"
-            # Keyless cosign — identity = this repo (We-Amp/modpagespeed-images).
+            # Keyless cosign, identity = this repo (We-Amp/modpagespeed-images).
             cosign sign --yes "${REGISTRY}/pagespeed-${img}@${DIGEST}"
             syft "${REGISTRY}/pagespeed-${img}@${DIGEST}" -o spdx-json > sbom-${img}.spdx.json
             cosign attest --yes --type spdxjson --predicate sbom-${img}.spdx.json "${REGISTRY}/pagespeed-${img}@${DIGEST}"
@@ -287,29 +427,29 @@ jobs:
 
       # SLSA build provenance, attached to each image by manifest digest
       # (push-to-registry so consumers can `gh attestation verify` the GHCR
-      # image directly). One step per image — attest-build-provenance takes a
+      # image directly). One step per image, attest-build-provenance takes a
       # single subject per invocation.
       # continue-on-error: GitHub's attestation API requires a public repo or a
       # paid plan; on a free private repo it returns "Feature not available".
       # The keyless cosign signatures + SBOM attestations above do NOT use that
       # API and are unaffected, so a missing SLSA attestation must not fail the
       # publish. Make this repo public (or upgrade the plan) to light it up.
-      - name: SLSA build provenance — nginx
-        uses: actions/attest-build-provenance@v1
+      - name: SLSA build provenance - nginx
+        uses: actions/attest-build-provenance@ef244123eb79f2f7a7e75d99086184180e6d0018 # v1
         continue-on-error: true
         with:
           subject-name: ${{ env.REGISTRY }}/pagespeed-nginx
           subject-digest: ${{ steps.sign.outputs.digest_nginx }}
           push-to-registry: true
-      - name: SLSA build provenance — worker
-        uses: actions/attest-build-provenance@v1
+      - name: SLSA build provenance - worker
+        uses: actions/attest-build-provenance@ef244123eb79f2f7a7e75d99086184180e6d0018 # v1
         continue-on-error: true
         with:
           subject-name: ${{ env.REGISTRY }}/pagespeed-worker
           subject-digest: ${{ steps.sign.outputs.digest_worker }}
           push-to-registry: true
-      - name: SLSA build provenance — combined
-        uses: actions/attest-build-provenance@v1
+      - name: SLSA build provenance - combined
+        uses: actions/attest-build-provenance@ef244123eb79f2f7a7e75d99086184180e6d0018 # v1
         continue-on-error: true
         with:
           subject-name: ${{ env.REGISTRY }}/pagespeed-combined
