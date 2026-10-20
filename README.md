@@ -33,9 +33,13 @@ Agent install recipes:
 
 ## Verifying images
 
+The images are signed only by `publish-images.yml` on `main`. Check that exact
+identity: a pattern on the repository URL would also accept a signature from
+any other workflow or branch of this repository.
+
 ```bash
 cosign verify \
-  --certificate-identity-regexp '^https://github.com/We-Amp/modpagespeed-images/' \
+  --certificate-identity https://github.com/We-Amp/modpagespeed-images/.github/workflows/publish-images.yml@refs/heads/main \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   ghcr.io/we-amp/pagespeed-combined:latest
 
