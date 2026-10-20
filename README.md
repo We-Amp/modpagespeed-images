@@ -43,15 +43,17 @@ gh attestation verify oci://ghcr.io/we-amp/pagespeed-combined:latest \
   --repo We-Amp/modpagespeed-images
 ```
 
-## Building from a public source tag
+## How the images are built
 
-The publish workflow accepts two optional inputs, `source_tag` and `source_sha`
-(also read from the release dispatch payload). When `source_sha` is set, the
-images are built from the public [pagespeed-optimizer](https://github.com/We-Amp/pagespeed-optimizer)
-source at that commit, checked out without credentials. The workflow first
-verifies that `source_tag` points at exactly that commit and fails otherwise.
-The image creation date and source revision labels then come from that public
-commit. Without these inputs the workflow behaves as before.
+The publish workflow is started by the release run of the public
+[pagespeed-optimizer](https://github.com/We-Amp/pagespeed-optimizer) repository,
+which sends its run id, the release tag and the tag's commit. Before anything is
+built the workflow checks those against the GitHub API: the run must belong to that
+repository, come from its release workflow, match the tag and commit, and have built
+the Linux image inputs successfully. The inputs are then downloaded from that run,
+their digests are verified, and the images are built from the source at that commit.
+The revision label and the creation date come from that commit, and the release run
+is recorded in a label. Publishing needs a tag-triggered run and an approval.
 
 ## License
 
