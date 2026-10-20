@@ -62,6 +62,8 @@ jobs:
       artifacts_repository: ${{ steps.r.outputs.artifacts_repository }}
       run_id: ${{ steps.r.outputs.run_id }}
       run_url: ${{ steps.verify.outputs.run_url }}
+      artifact_id_x64: ${{ steps.verify.outputs.artifact_id_x64 }}
+      artifact_id_arm64: ${{ steps.verify.outputs.artifact_id_arm64 }}
     steps:
       - id: r
         env:
@@ -88,12 +90,17 @@ jobs:
             ST="$IN_SOURCE_TAG_MANUAL"; SS="$IN_SOURCE_SHA_MANUAL"; M="$IN_MODE_MANUAL"
           fi
           V="${V#v}"   # strip a leading v
-          # Format checks only; what the values mean is verified in the next step.
-          printf '%s' "$V" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' || { echo "::error::version must look like 2.5.0"; exit 1; }
-          printf '%s' "$RID" | grep -Eq '^[0-9]{1,20}$' || { echo "::error::run_id must be a number"; exit 1; }
-          printf '%s' "$SS" | grep -Eq '^[0-9a-f]{40}$' || { echo "::error::source_sha must be a 40-char lowercase hex SHA"; exit 1; }
-          printf '%s' "$ST" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$' || { echo "::error::source_tag must look like v2.5.0"; exit 1; }
-          case "$M" in dry-run|publish) ;; *) echo "::error::mode must be dry-run or publish"; exit 1 ;; esac
+          # Format checks only; what the values mean is verified in the next
+          # step. [[ =~ ]] matches the whole value, so a newline cannot slip in.
+          for X in "$V" "$AR" "$RID" "$ST" "$SS" "$M"; do
+            [[ "$X" != *$'\n'* && "$X" != *$'\r'* ]] || { echo "::error::inputs must not contain line breaks"; exit 1; }
+          done
+          [[ "$V" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::version must look like 2.5.0"; exit 1; }
+          [[ "$AR" == "$ALLOWED_ARTIFACTS_REPO" ]] || { echo "::error::artifacts_repository must be exactly $ALLOWED_ARTIFACTS_REPO"; exit 1; }
+          [[ "$RID" =~ ^[0-9]{1,20}$ ]] || { echo "::error::run_id must be digits only"; exit 1; }
+          [[ "$SS" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::source_sha must be a 40-char lowercase hex SHA"; exit 1; }
+          [[ "$ST" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::source_tag must look like v2.5.0"; exit 1; }
+          [[ "$M" == dry-run || "$M" == publish ]] || { echo "::error::mode must be dry-run or publish"; exit 1; }
           {
             echo "version=$V"; echo "mode=$M"; echo "source_tag=$ST"; echo "source_sha=$SS"
             echo "artifacts_repository=$AR"; echo "run_id=$RID"
@@ -181,8 +188,12 @@ jobs:
           ARTS="$(gh api "repos/${ALLOWED_ARTIFACTS_REPO}/actions/runs/${RUN_ID}/artifacts?per_page=100")"
           for A in docker-artifacts-linux-x64 docker-artifacts-linux-arm64; do
             D="$(printf '%s' "$ARTS" | jq -r --arg a "$A" '[.artifacts[] | select(.name == $a and .expired == false)][0].digest // empty')"
-            if printf '%s' "$D" | grep -Eq '^sha256:[0-9a-f]{64}$'; then
-              echo "artifact $A $D"
+            AID="$(printf '%s' "$ARTS" | jq -r --arg a "$A" '[.artifacts[] | select(.name == $a and .expired == false)][0].id // empty')"
+            if [[ "$D" =~ ^sha256:[0-9a-f]{64}$ && "$AID" =~ ^[0-9]+$ ]]; then
+              echo "artifact $A id=$AID $D"
+              # The build jobs download these exact ids, so the artifact
+              # fetched is the one whose digest was just recorded.
+              echo "artifact_id_${A#docker-artifacts-linux-}=$AID" >> "$GITHUB_OUTPUT"
             else
               bad "artifact $A is missing, expired or has no digest"
             fi
@@ -245,7 +256,7 @@ jobs:
       - name: Download the release run's image artifacts
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: docker-artifacts-linux-${{ matrix.art_arch }}
+          artifact-ids: ${{ matrix.art_arch == 'x64' && needs.resolve.outputs.artifact_id_x64 || needs.resolve.outputs.artifact_id_arm64 }}
           repository: ${{ needs.resolve.outputs.artifacts_repository }}
           run-id: ${{ needs.resolve.outputs.run_id }}
           github-token: ${{ secrets.ARTIFACTS_READ_TOKEN }}
@@ -332,9 +343,15 @@ jobs:
         working-directory: product
         run: |
           set -uo pipefail
-          # Installer and release are both pinned to the same tag.
-          GRYPE_VERSION=v0.121.0
-          curl -sSfL "https://raw.githubusercontent.com/anchore/grype/${GRYPE_VERSION}/install.sh" | sh -s -- -b /usr/local/bin "${GRYPE_VERSION}"
+          # grype 0.121.0, release tarball verified against a pinned sha256.
+          GRYPE_VERSION=0.121.0
+          case "$ARCH" in
+            amd64) GRYPE_SHA=64e07133d3486115de647a66581461dccf5c732748a0a3119077395565f15519 ;;
+            arm64) GRYPE_SHA=86f570f75ca947ea3dd6486309232bcff6d78e44ba081ae75ab14eab72be3dae ;;
+          esac
+          curl -sSfL -o "${RUNNER_TEMP}/grype.tgz" "https://github.com/anchore/grype/releases/download/v${GRYPE_VERSION}/grype_${GRYPE_VERSION}_linux_${ARCH}.tar.gz"
+          echo "${GRYPE_SHA}  ${RUNNER_TEMP}/grype.tgz" | sha256sum -c -
+          sudo tar -xzf "${RUNNER_TEMP}/grype.tgz" -C /usr/local/bin grype
           for img in nginx worker combined; do
             echo "::group::grype pagespeed-${img}:${VERSION}-${ARCH}"
             grype "pagespeed-${img}:${VERSION}-${ARCH}" --add-cpes-if-none -o table || true
@@ -342,7 +359,7 @@ jobs:
           done
 
       # Publish mode only: hand the smoked images to the gated `publish` job
-      # as a one-day workflow artifact. Nothing is pushed from here.
+      # as a short-lived workflow artifact. Nothing is pushed from here.
       - name: Save the images for the gated publish job
         if: ${{ env.MODE == 'publish' }}
         run: |
@@ -359,7 +376,8 @@ jobs:
         with:
           name: images-${{ matrix.arch }}
           path: ${{ runner.temp }}/images-${{ matrix.arch }}.tar.gz
-          retention-days: 1
+          # An approval later than this needs a full re-run.
+          retention-days: 7
           if-no-files-found: error
 
   publish:
@@ -367,6 +385,11 @@ jobs:
     if: ${{ needs.resolve.outputs.mode == 'publish' }}
     runs-on: ubuntu-latest
     environment: production   # <-- THE GATE: requires manual approval before any push/sign
+    # One publish per version at a time, so two approved runs cannot race on
+    # the tags (:latest included). Queued runs wait; none is cancelled.
+    concurrency:
+      group: publish-${{ needs.resolve.outputs.version }}
+      cancel-in-progress: false
     permissions:
       contents: read
       packages: write
@@ -385,7 +408,8 @@ jobs:
       - name: Login to GHCR
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: echo "$GH_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          ACTOR: ${{ github.actor }}
+        run: echo "$GH_TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
 
       - name: Push the per-arch images
         run: |
@@ -401,8 +425,12 @@ jobs:
       - name: Install cosign + syft
         uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
       - run: |
-          SYFT_VERSION=v1.55.0
-          curl -sSfL "https://raw.githubusercontent.com/anchore/syft/${SYFT_VERSION}/install.sh" | sh -s -- -b /usr/local/bin "${SYFT_VERSION}"
+          # syft 1.55.0 (linux amd64), release tarball verified against a pinned sha256.
+          SYFT_VERSION=1.55.0
+          SYFT_SHA=bb65249542db5fedeeb4d3f9b018b75e7264dbfbbb10486f044581a92f90490d
+          curl -sSfL -o "${RUNNER_TEMP}/syft.tgz" "https://github.com/anchore/syft/releases/download/v${SYFT_VERSION}/syft_${SYFT_VERSION}_linux_amd64.tar.gz"
+          echo "${SYFT_SHA}  ${RUNNER_TEMP}/syft.tgz" | sha256sum -c -
+          sudo tar -xzf "${RUNNER_TEMP}/syft.tgz" -C /usr/local/bin syft
 
       - name: Create multi-arch manifests, sign + SBOM-attest (keyless)
         id: sign
