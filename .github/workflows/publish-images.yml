@@ -382,7 +382,10 @@ jobs:
 
   publish:
     needs: [resolve, build]
-    if: ${{ needs.resolve.outputs.mode == 'publish' }}
+    # Publish only from the workflow on main: the signing identity verifiers
+    # pin is publish-images.yml@refs/heads/main, and the production
+    # environment is the gate for that ref alone.
+    if: ${{ needs.resolve.outputs.mode == 'publish' && github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-latest
     environment: production   # <-- THE GATE: requires manual approval before any push/sign
     # One publish per version at a time, so two approved runs cannot race on
