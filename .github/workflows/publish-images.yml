@@ -149,9 +149,38 @@ jobs:
           [ "$(field .head_branch)" = "$SOURCE_TAG" ] || bad "run head_branch is '$(field .head_branch)', not $SOURCE_TAG"
           [ "$(field .head_sha)" = "$SOURCE_SHA" ] || bad "run head_sha is '$(field .head_sha)', not $SOURCE_SHA"
           if [ "$RUN_EVENT" = "push" ]; then
-            printf '%s' "$RUN" | jq -e --arg p "$NUGET_REF" --arg s "$SOURCE_SHA" \
-              '[.referenced_workflows[]? | select((.path | startswith($p)) and .sha == $s)] | length > 0' >/dev/null \
-              || bad "pipeline-release-nuget.yml was not called at $SOURCE_SHA"
+            # The tag's release.yml calls the pipeline @main, so GitHub runs
+            # it at main's head when the tag is pushed. That is SOURCE_SHA
+            # when the tag is cut at main's head. When main has moved on, the
+            # called sha is accepted only if it is a descendant of SOURCE_SHA
+            # and the release code it ran is unchanged from SOURCE_SHA: the
+            # pipeline file itself, the repository's local actions, the CI
+            # scripts, and the two files it reads from main (the version
+            # file and the public release-signing key) are the same git
+            # objects at both commits.
+            CALLED="$(printf '%s' "$RUN" | jq -r --arg p "$NUGET_REF" \
+              '[.referenced_workflows[]? | select((.path | startswith($p)) and .ref == "refs/heads/main") | .sha][0] // empty')"
+            if [ -z "$CALLED" ]; then
+              bad "pipeline-release-nuget.yml was not called at $SOURCE_SHA"
+            elif [ "$CALLED" != "$SOURCE_SHA" ]; then
+              object_at() { # <commit> <path>: the git object id of <path> at <commit>
+                gh api "repos/${ALLOWED_ARTIFACTS_REPO}/contents/$(dirname "$2")?ref=$1" \
+                  | jq -r --arg n "$(basename "$2")" '[.[] | select(.name == $n) | .sha][0] // empty'
+              }
+              STATUS="$(gh api "repos/${ALLOWED_ARTIFACTS_REPO}/compare/${SOURCE_SHA}...${CALLED}" --jq '.status')" || STATUS=""
+              if [ "$STATUS" != "ahead" ]; then
+                bad "pipeline-release-nuget.yml was called at $CALLED, which is not a descendant of $SOURCE_SHA (compare: '${STATUS:-error}')"
+              else
+                BEFORE=$FAILS
+                for P in .github/workflows/pipeline-release-nuget.yml .github/actions tools/ci VERSION.txt RELEASE-SIGNING-KEY.asc; do
+                  A="$(object_at "$SOURCE_SHA" "$P")"; B="$(object_at "$CALLED" "$P")"
+                  if [ -z "$A" ] || [ "$A" != "$B" ]; then
+                    bad "pipeline-release-nuget.yml was called at $CALLED, and $P differs from $SOURCE_SHA (${A:-missing} vs ${B:-missing})"
+                  fi
+                done
+                [ "$FAILS" -eq "$BEFORE" ] && echo "pipeline-release-nuget.yml was called at $CALLED, a descendant of $SOURCE_SHA with the same release code"
+              fi
+            fi
           fi
 
           # 3. Publishing needs a real tag run; rehearsals may use a dispatch.
