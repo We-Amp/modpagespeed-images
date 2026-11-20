@@ -344,7 +344,7 @@ jobs:
           run_combined() {  # $1 = extra env args
             docker rm -f combined >/dev/null 2>&1 || true
             docker run -d --name combined --network "$NET" --shm-size=256m \
-              -e BACKEND_HOST=origin -e BACKEND_PORT=80 -e ACCEPT_EULA=Y $1 \
+              -e BACKEND_HOST=origin -e BACKEND_PORT=80 $1 \
               "pagespeed-combined:${VERSION}-${ARCH}" >/dev/null
           }
           warm_and_get() {  # poll until X-PageSpeed appears (async warm-up), capture headers
