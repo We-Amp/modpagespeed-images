@@ -19,7 +19,7 @@ nginx images use immutable version tags.
 
 ```bash
 docker run --rm -p 80:80 \
-  -e BACKEND_HOST=your-origin -e BACKEND_PORT=8081 -e ACCEPT_EULA=Y \
+  -e BACKEND_HOST=your-origin -e BACKEND_PORT=8081 \
   ghcr.io/we-amp/pagespeed-combined:latest
 ```
 
